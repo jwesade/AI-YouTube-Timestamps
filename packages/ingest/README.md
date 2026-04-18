@@ -26,9 +26,22 @@ v0 (this iteration) only implements the leftmost step — source fetchers. They 
 ```bash
 cd packages/ingest
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
+
+# Single source, raw snapshot:
 python -m ingest run --source osm
 # → ./data/courts_osm.json  (≈50–200 records)
+
+# Full pipeline (fetch -> validate -> dedupe):
+python -m ingest pipeline --source osm
+# → ./data/pipeline_summary.json  + ./data/courts_clustered.json
+```
+
+Run tests + linter:
+
+```bash
+pytest -q
+ruff check .
 ```
 
 ## Project layout
@@ -37,12 +50,16 @@ python -m ingest run --source osm
 ingest/
   __init__.py
   __main__.py        → python -m ingest
-  cli.py             → typer commands (run, list-sources)
+  cli.py             → typer commands (run, pipeline, list-sources)
   models.py          → SourceRecord, FetchResult (pydantic)
+  validate.py        → deterministic filter (bbox, empty names, country)
+  dedupe.py          → deterministic clusterer (haversine + name Jaccard)
+  pipeline.py        → orchestration: fetch -> validate -> dedupe
   sources/
     __init__.py      → REGISTRY of sources
     base.py          → Source protocol
     osm.py           → Overpass API fetcher
+tests/               → pytest suite
 data/                → output snapshots (gitignored)
 ```
 

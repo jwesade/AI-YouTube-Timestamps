@@ -36,9 +36,16 @@ docs/               → Architektur, Entscheidungen, Onboarding
 # Ingest ausführen (OSM, keine API-Keys nötig)
 cd packages/ingest
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
-python -m ingest run --source osm
-# → schreibt ./data/courts_osm.json
+pip install -e ".[dev]"
+
+# Komplette Pipeline: fetch -> validate -> dedupe
+python -m ingest pipeline --source osm
+# → schreibt ./data/pipeline_summary.json und ./data/courts_clustered.json
 ```
 
-Details und Onboarding-Guide: [`docs/onboarding.md`](docs/onboarding.md)
+## Weiterführend
+
+- [`docs/onboarding.md`](docs/onboarding.md) — Laptop-Setup Schritt für Schritt
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records (warum dieser Stack, warum agent-orchestriert, …)
+- [`packages/ingest/README.md`](packages/ingest/README.md) — Details zur Scraping-Pipeline
+- [`packages/db/README.md`](packages/db/README.md) — DB-Schema und Supabase-Setup
