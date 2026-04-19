@@ -3,9 +3,10 @@
 Free, no API key, Creative Commons licensed. Good coverage of clubs that OSM
 contributors have tagged; missing many commercial sites. Use as baseline.
 
-The main Overpass instance (overpass-api.de) is frequently overloaded and
-returns 504/503 on Germany-wide queries. We try several public mirrors in
-order and fall back across them.
+The main Overpass instance (overpass-api.de) is frequently overloaded and a
+Germany-wide query times out (504) regularly across all public mirrors.
+We query each Bundesland separately so individual queries stay small enough
+to slip through. Failures of single regions don't kill the whole run.
 """
 
 from __future__ import annotations
@@ -20,21 +21,40 @@ from ingest.models import FetchResult, SourceRecord
 
 log = logging.getLogger(__name__)
 
-# Public Overpass mirrors, ordered by observed reliability. Kumi first because
-# it's usually the fastest for Europe-wide queries; the main instance last
-# because it's the most throttled.
+# Public Overpass mirrors, ordered by observed reliability.
 OVERPASS_ENDPOINTS: tuple[str, ...] = (
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 )
 
-# Any OSM node/way/relation tagged sport=padel inside Germany.
-OVERPASS_QUERY_DE = """
-[out:json][timeout:180];
-area["ISO3166-1"="DE"][admin_level=2]->.de;
+# All 16 German Bundesländer by ISO 3166-2 code.
+BUNDESLAND_ISO_CODES: tuple[str, ...] = (
+    "DE-BW",  # Baden-Württemberg
+    "DE-BY",  # Bayern
+    "DE-BE",  # Berlin
+    "DE-BB",  # Brandenburg
+    "DE-HB",  # Bremen
+    "DE-HH",  # Hamburg
+    "DE-HE",  # Hessen
+    "DE-MV",  # Mecklenburg-Vorpommern
+    "DE-NI",  # Niedersachsen
+    "DE-NW",  # Nordrhein-Westfalen
+    "DE-RP",  # Rheinland-Pfalz
+    "DE-SL",  # Saarland
+    "DE-SN",  # Sachsen
+    "DE-ST",  # Sachsen-Anhalt
+    "DE-SH",  # Schleswig-Holstein
+    "DE-TH",  # Thüringen
+)
+
+# Query template per Bundesland (ISO 3166-2 region). Smaller scope means
+# faster execution and fewer 504s than a Germany-wide query.
+OVERPASS_QUERY_REGION_TEMPLATE = """
+[out:json][timeout:60];
+area["ISO3166-2"="{iso}"][admin_level=4]->.region;
 (
-  nwr["sport"="padel"](area.de);
+  nwr["sport"="padel"](area.region);
 );
 out center tags;
 """.strip()
@@ -48,52 +68,81 @@ class OSMSource:
     def __init__(
         self,
         endpoints: tuple[str, ...] = OVERPASS_ENDPOINTS,
-        timeout: float = 200.0,
+        regions: tuple[str, ...] = BUNDESLAND_ISO_CODES,
+        timeout: float = 90.0,
+        polite_delay_s: float = 1.0,
     ):
         self._endpoints = endpoints
+        self._regions = regions
         self._timeout = timeout
+        self._polite_delay_s = polite_delay_s
 
     def fetch(self) -> FetchResult:
-        log.info("fetching padel courts from OSM Overpass (DE)")
-        payload = self._request_with_failover()
+        log.info("fetching padel courts from OSM Overpass (%d Bundesländer)", len(self._regions))
+        all_elements: list[dict[str, Any]] = []
+        failed: list[tuple[str, str]] = []
+
+        with httpx.Client(timeout=self._timeout, headers=self._headers()) as client:
+            for iso in self._regions:
+                query = OVERPASS_QUERY_REGION_TEMPLATE.format(iso=iso)
+                try:
+                    payload = self._request_with_failover(client, query, iso)
+                    elements = payload.get("elements", [])
+                    log.info("region %s: %d raw elements", iso, len(elements))
+                    all_elements.extend(elements)
+                except RuntimeError as exc:
+                    log.warning("region %s failed: %s", iso, exc)
+                    failed.append((iso, str(exc)))
+                time.sleep(self._polite_delay_s)
+
+        if failed and len(failed) == len(self._regions):
+            raise RuntimeError(f"all {len(self._regions)} regions failed (Overpass overloaded?)")
+        if failed:
+            log.warning(
+                "partial result: %d/%d regions failed: %s",
+                len(failed),
+                len(self._regions),
+                [iso for iso, _ in failed],
+            )
 
         records: list[SourceRecord] = []
-        for element in payload.get("elements", []):
+        for element in all_elements:
             record = _element_to_record(element)
             if record is not None:
                 records.append(record)
 
         log.info(
-            "OSM returned %d elements, kept %d records",
-            len(payload.get("elements", [])),
+            "OSM total: %d raw elements across regions, %d valid records",
+            len(all_elements),
             len(records),
         )
         return FetchResult(source_type="osm", records=records)
 
-    def _request_with_failover(self) -> dict[str, Any]:
-        headers = {
+    def _headers(self) -> dict[str, str]:
+        return {
             "User-Agent": "padel-atlas-de/0.1 (+https://github.com/jwesade/ai-youtube-timestamps)",
             "Accept": "application/json",
         }
-        errors: list[tuple[str, Exception]] = []
-        with httpx.Client(timeout=self._timeout, headers=headers) as client:
-            for endpoint in self._endpoints:
-                try:
-                    log.info("trying Overpass endpoint: %s", endpoint)
-                    resp = client.post(endpoint, data={"data": OVERPASS_QUERY_DE})
-                    if resp.status_code in _RETRYABLE_STATUS:
-                        raise httpx.HTTPStatusError(
-                            f"status {resp.status_code}", request=resp.request, response=resp
-                        )
-                    resp.raise_for_status()
-                    return resp.json()
-                except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-                    log.warning("endpoint %s failed: %s", endpoint, exc)
-                    errors.append((endpoint, exc))
-                    time.sleep(2)
 
+    def _request_with_failover(
+        self, client: httpx.Client, query: str, label: str
+    ) -> dict[str, Any]:
+        errors: list[tuple[str, Exception]] = []
+        for endpoint in self._endpoints:
+            try:
+                log.debug("[%s] trying %s", label, endpoint)
+                resp = client.post(endpoint, data={"data": query})
+                if resp.status_code in _RETRYABLE_STATUS:
+                    raise httpx.HTTPStatusError(
+                        f"status {resp.status_code}", request=resp.request, response=resp
+                    )
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                errors.append((endpoint, exc))
+                time.sleep(1)
         detail = "; ".join(f"{url}: {err}" for url, err in errors)
-        raise RuntimeError(f"all Overpass endpoints failed ({detail})")
+        raise RuntimeError(f"all endpoints failed ({detail})")
 
 
 def _element_to_record(element: dict[str, Any]) -> SourceRecord | None:
