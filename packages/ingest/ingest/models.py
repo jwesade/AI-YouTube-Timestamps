@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 SourceType = Literal[
     "osm",
@@ -23,7 +23,7 @@ class SourceRecord(BaseModel):
 
     source_type: SourceType
     source_ref: str | None = None
-    source_url: HttpUrl | None = None
+    source_url: str | None = None
     name: str
     address: str | None = None
     city: str | None = None
@@ -35,7 +35,7 @@ class SourceRecord(BaseModel):
     indoor: bool | None = None
     outdoor: bool | None = None
     operator: str | None = None
-    booking_url: HttpUrl | None = None
+    booking_url: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

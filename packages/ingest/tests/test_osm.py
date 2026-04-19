@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ingest.sources.osm import _element_to_record
+from ingest.sources.osm import _element_to_record, _normalize_url
 
 _NODE_FIXTURE = {
     "type": "node",
@@ -58,3 +58,33 @@ def test_way_uses_center_coords():
 def test_element_without_coords_is_skipped():
     broken = {"type": "node", "id": 1, "tags": {"sport": "padel", "name": "x"}}
     assert _element_to_record(broken) is None
+
+
+def test_normalize_url_prepends_https():
+    assert _normalize_url("mittepadel.com") == "https://mittepadel.com"
+
+
+def test_normalize_url_keeps_existing_scheme():
+    assert _normalize_url("http://padel.de/book") == "http://padel.de/book"
+    assert _normalize_url("https://padel.de") == "https://padel.de"
+
+
+def test_normalize_url_rejects_junk():
+    assert _normalize_url(None) is None
+    assert _normalize_url("") is None
+    assert _normalize_url("   ") is None
+    assert _normalize_url("N/A") is None
+    assert _normalize_url("foo bar") is None
+
+
+def test_bare_domain_booking_url_accepted():
+    node = {
+        "type": "node",
+        "id": 42,
+        "lat": 52.5,
+        "lon": 13.4,
+        "tags": {"sport": "padel", "name": "Mitte Padel", "website": "mittepadel.com"},
+    }
+    record = _element_to_record(node)
+    assert record is not None
+    assert record.booking_url == "https://mittepadel.com"

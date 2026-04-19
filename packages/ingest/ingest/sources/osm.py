@@ -125,9 +125,27 @@ def _element_to_record(element: dict[str, Any]) -> SourceRecord | None:
         indoor=indoor,
         outdoor=outdoor,
         operator=tags.get("operator"),
-        booking_url=tags.get("website") or tags.get("contact:website"),
+        booking_url=_normalize_url(tags.get("website") or tags.get("contact:website")),
         raw=element,
     )
+
+
+def _normalize_url(value: Any) -> str | None:
+    """Coerce OSM website tags into proper URLs. OSM contributors commonly write
+    'example.com' without a scheme, or leave junk like 'N/A'. Return None for
+    anything that doesn't look like a real URL."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or " " in cleaned:
+        return None
+    if not cleaned.startswith(("http://", "https://")):
+        cleaned = "https://" + cleaned
+    # Must contain a dot in the host portion.
+    host = cleaned.split("://", 1)[1].split("/", 1)[0]
+    if "." not in host:
+        return None
+    return cleaned
 
 
 def _coords(element: dict[str, Any]) -> tuple[float | None, float | None]:
