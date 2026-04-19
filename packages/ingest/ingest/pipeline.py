@@ -1,9 +1,10 @@
 """Orchestrates one end-to-end ingest run.
 
-Steps: fetch -> validate -> dedupe -> group_into_venues -> (normalize) -> (write).
+Steps: fetch -> validate -> dedupe -> group_into_venues -> (geocode) ->
+(normalize) -> (write).
 
-Normalize and write are opt-in so the pipeline stays useful locally without
-API keys or DB credentials.
+Geocode, normalize and write are opt-in so the pipeline stays useful locally
+without API keys or DB credentials.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 from ingest import sources
 from ingest.agents.normalizer import NormalizedCourt, normalize_venue
 from ingest.dedupe import Cluster, dedupe
+from ingest.geocode import NominatimGeocoder
 from ingest.models import FetchResult, SourceRecord
 from ingest.validate import ValidationReport, validate
 from ingest.venues import Venue, group_into_venues
@@ -67,6 +69,7 @@ def run_pipeline(
     *,
     use_llm: bool = False,
     write_to_db: bool = False,
+    enrich_via_geocode: bool = True,
 ) -> PipelineReport:
     started = datetime.now(timezone.utc)
     fetches: list[FetchResult] = []
@@ -84,6 +87,8 @@ def run_pipeline(
 
     llm = _build_llm() if use_llm else None
     normalized = [normalize_venue(v, llm=llm) for v in venues]
+    if enrich_via_geocode:
+        normalized = _enrich_missing_locations(normalized)
 
     write_stats: dict[str, int] | None = None
     if write_to_db:
@@ -103,6 +108,58 @@ def run_pipeline(
     )
     log.info("pipeline done: %s", report.summary())
     return report
+
+
+def _enrich_missing_locations(normalized: list[NormalizedCourt]) -> list[NormalizedCourt]:
+    """Fill missing city / postal_code / address via Nominatim reverse geocoding.
+
+    Rate-limited to 1 req/s by the geocoder itself. Only queries venues that
+    actually lack city info — no wasted calls.
+    """
+    missing = [nc for nc in normalized if not nc.city]
+    if not missing:
+        return normalized
+
+    log.info("reverse-geocoding %d venues missing city info (≈%ds)", len(missing), len(missing))
+    geocoder = NominatimGeocoder()
+    enriched_by_idx: dict[int, NormalizedCourt] = {}
+    for idx, nc in enumerate(normalized):
+        if nc.city:
+            continue
+        result = geocoder.reverse(nc.lat, nc.lng)
+        if result is None:
+            continue
+        updates: dict[str, object] = {}
+        if not nc.city and result.city:
+            updates["city"] = result.city
+        if not nc.postal_code and result.postal_code:
+            updates["postal_code"] = result.postal_code
+        if not nc.address and result.address:
+            updates["address"] = result.address
+        if updates:
+            enriched_by_idx[idx] = nc.model_copy(update=updates)
+
+    if not enriched_by_idx:
+        return normalized
+
+    log.info("reverse-geocoding enriched %d venues", len(enriched_by_idx))
+    # After geocoding, the name-composition logic may now be able to do better
+    # (e.g. 'Unbekannter…' → 'Padel Bremen' once the city is filled in).
+    return [_recompose_name(enriched_by_idx.get(i, nc)) for i, nc in enumerate(normalized)]
+
+
+def _recompose_name(nc: NormalizedCourt) -> NormalizedCourt:
+    from ingest.agents.normalizer import _compose_name
+
+    new_name = _compose_name(
+        name=nc.name,
+        operator=nc.operator,
+        city=nc.city,
+        address=nc.address,
+    )
+    if new_name == nc.name:
+        return nc
+    return nc.model_copy(update={"name": new_name})
 
 
 def _build_llm():

@@ -1,8 +1,9 @@
 """Normalizer: turns a Cluster of SourceRecords into one canonical NormalizedCourt.
 
 Deterministic merge fills in what it can; the LLM is only called when there's
-ambiguity (conflicting names, missing fields that might be inferable). Keeps
-cost low and output reproducible for the easy cases.
+ambiguity (conflicting names, weak/generic primary names that could be improved
+from context) and a LLM client is provided. Keeps cost low and output
+reproducible for the easy cases.
 
 For Venues (groups of clusters at the same physical location), use
 `normalize_venue` instead — it normalizes the venue's "best" cluster and
@@ -12,6 +13,7 @@ sets the canonical `court_count` from the actual number of pitches found.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -85,7 +87,8 @@ def _venue_primary_cluster(venue: Venue) -> Cluster:
 
 
 def _deterministic_merge(cluster: Cluster) -> NormalizedCourt:
-    """Take the most complete record as the base, fill gaps from others."""
+    """Take the most complete record as the base, fill gaps from others, and
+    derive a better name when the primary's name is too generic to be useful."""
     primary = cluster.primary
     merged: dict[str, object | None] = primary.model_dump()
 
@@ -107,6 +110,13 @@ def _deterministic_merge(cluster: Cluster) -> NormalizedCourt:
                 if value not in (None, ""):
                     merged[field_name] = value
 
+    merged["name"] = _compose_name(
+        name=str(merged.get("name") or ""),
+        operator=_as_str(merged.get("operator")),
+        city=_as_str(merged.get("city")),
+        address=_as_str(merged.get("address")),
+    )
+
     confidence = _confidence_from_cluster(cluster)
     return NormalizedCourt(
         name=str(merged["name"]),
@@ -125,12 +135,69 @@ def _deterministic_merge(cluster: Cluster) -> NormalizedCourt:
     )
 
 
+# Patterns that make a name "weak": it tells a user nothing about the venue.
+_WEAK_NAME_PATTERNS = (
+    re.compile(r"^\s*$"),
+    re.compile(r"^unbekannt", re.IGNORECASE),
+    re.compile(r"^padel\s*(court|platz|anlage)?\s*$", re.IGNORECASE),
+    re.compile(r"^court\s*\d+", re.IGNORECASE),
+    re.compile(r"^\d+$"),  # just a number like "1"
+    re.compile(r"^outdoor\s+\w+\s*\d*$", re.IGNORECASE),  # "Outdoor Spree 2"
+    re.compile(r"^(cupra|oysho|heineken).*court", re.IGNORECASE),  # sponsored-court names
+)
+
+
+def _is_weak_name(name: str) -> bool:
+    name = (name or "").strip()
+    if not name:
+        return True
+    return any(p.search(name) for p in _WEAK_NAME_PATTERNS)
+
+
+def _compose_name(
+    *,
+    name: str,
+    operator: str | None,
+    city: str | None,
+    address: str | None,
+) -> str:
+    """Keep strong names as-is. For weak ones, synthesise something useful from
+    operator/city/address so the venue isn't shown as 'Unbekannter Padel-Court'
+    when we actually have enough context to name it."""
+    if not _is_weak_name(name):
+        return name.strip()
+    if operator:
+        if city and not operator.lower().endswith(city.lower()):
+            return f"{operator} {city}"
+        return operator
+    if address and city:
+        street = address.split(",")[0].strip()
+        street = re.sub(r"\s*\d+[a-zA-Z-]*$", "", street).strip()  # drop house number
+        if street:
+            return f"Padel {city}, {street}"
+        return f"Padel {city}"
+    if city:
+        return f"Padel {city}"
+    return name.strip() or "Padel-Anlage"
+
+
 def _needs_llm(cluster: Cluster) -> bool:
-    """Call the LLM only when records disagree on something non-trivial."""
-    if len(cluster.records) < 2:
-        return False
+    """Call the LLM when there's ambiguity worth resolving:
+      1) records disagree on the venue name, or
+      2) the primary's name is still weak after deterministic composition
+         but there's enough context (address/operator/city) to maybe do better.
+    """
     names = {r.name.strip().lower() for r in cluster.records if r.name}
-    return len(names) > 1
+    if len(names) > 1:
+        return True
+
+    primary = cluster.primary
+    if _is_weak_name(primary.name):
+        has_context = any(
+            getattr(r, f) for r in cluster.records for f in ("address", "city", "operator")
+        )
+        return has_context
+    return False
 
 
 def _llm_merge(
