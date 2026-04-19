@@ -100,3 +100,28 @@ docker-compose.override.yml
 *.sqlite
 *.db
 *.db-journal
+
+# ──────────────────────────────────────────────────────────────
+# Python
+# ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ──────────────────────────────────────────────────────────────
+# Ingest artefacts (scraped snapshots, not committed)
+# ──────────────────────────────────────────────────────────────
+packages/ingest/data/*
+!packages/ingest/data/.gitkeep
+
+# ──────────────────────────────────────────────────────────────
+# Next.js / Vercel
+# ──────────────────────────────────────────────────────────────
+.next/
+.vercel/
+out/
