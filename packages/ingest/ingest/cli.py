@@ -38,11 +38,21 @@ def pipeline(
         ["osm"], "--source", "-s", help="Sources to include. Repeat for multiple."
     ),
     out_dir: Path = typer.Option(DATA_DIR, "--out-dir", "-o"),
+    normalize: bool = typer.Option(
+        False,
+        "--normalize/--no-normalize",
+        help="Call the LLM normalizer for ambiguous clusters (requires ANTHROPIC_API_KEY).",
+    ),
+    write: bool = typer.Option(
+        False,
+        "--write/--no-write",
+        help="Write results to Supabase (requires SUPABASE_DB_URL).",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run fetch -> validate -> dedupe end-to-end and write clusters + summary."""
+    """Run fetch -> validate -> dedupe (-> normalize -> write) end-to-end."""
     _configure_logging(verbose)
-    report = run_pipeline(sources_opt)
+    report = run_pipeline(sources_opt, use_llm=normalize, write_to_db=write)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "pipeline_summary.json"
@@ -51,11 +61,11 @@ def pipeline(
     summary_path.write_text(json.dumps(report.summary(), indent=2))
     clusters_payload = [
         {
-            "primary": c.primary.model_dump(mode="json"),
+            "normalized": nc.model_dump(mode="json"),
             "source_types": sorted(c.source_types),
             "record_count": len(c.records),
         }
-        for c in report.clusters
+        for c, nc in zip(report.clusters, report.normalized, strict=True)
     ]
     clusters_path.write_text(json.dumps(clusters_payload, indent=2, default=str))
 

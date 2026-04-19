@@ -27,14 +27,23 @@ v0 (this iteration) only implements the leftmost step — source fetchers. They 
 cd packages/ingest
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+cp .env.example .env    # then fill in SUPABASE_DB_URL and ANTHROPIC_API_KEY
 
-# Single source, raw snapshot:
+# 1) Single source, raw snapshot (no keys needed):
 python -m ingest run --source osm
-# → ./data/courts_osm.json  (≈50–200 records)
 
-# Full pipeline (fetch -> validate -> dedupe):
+# 2) Full pipeline, offline (no keys needed):
 python -m ingest pipeline --source osm
-# → ./data/pipeline_summary.json  + ./data/courts_clustered.json
+#   → ./data/pipeline_summary.json + ./data/courts_clustered.json
+#   → normalizer runs in its deterministic branch only
+
+# 3) Full pipeline + LLM normalization for ambiguous clusters:
+python -m ingest pipeline --source osm --normalize
+#   needs ANTHROPIC_API_KEY in .env
+
+# 4) Full pipeline -> write to Supabase:
+python -m ingest pipeline --source osm --normalize --write
+#   needs SUPABASE_DB_URL and ANTHROPIC_API_KEY in .env
 ```
 
 Run tests + linter:
@@ -51,17 +60,29 @@ ingest/
   __init__.py
   __main__.py        → python -m ingest
   cli.py             → typer commands (run, pipeline, list-sources)
+  config.py          → loads .env, exposes typed settings
   models.py          → SourceRecord, FetchResult (pydantic)
+  llm.py             → thin Anthropic Messages wrapper (structured output)
   validate.py        → deterministic filter (bbox, empty names, country)
   dedupe.py          → deterministic clusterer (haversine + name Jaccard)
-  pipeline.py        → orchestration: fetch -> validate -> dedupe
+  pipeline.py        → orchestration: fetch -> validate -> dedupe -> normalize -> write
   sources/
     __init__.py      → REGISTRY of sources
     base.py          → Source protocol
     osm.py           → Overpass API fetcher
+  agents/
+    normalizer.py    → merges a Cluster -> NormalizedCourt (deterministic + LLM)
+    (future: research.py using claude-agent-sdk)
+  writer/
+    supabase.py      → truncate-and-reload writer via psycopg
 tests/               → pytest suite
 data/                → output snapshots (gitignored)
 ```
+
+## When we use which SDK
+
+- **`anthropic`** (Messages API, one-shot): Normalizer and any other "input → structured JSON" task. Cheap, fast, deterministic at the call site.
+- **`claude-agent-sdk`** (full agent loop, tool use): planned for the research agent (read web pages, scrape PDFs, write reports) and the ops/quality-audit agent. Not used yet — the dependency is declared so the scaffolding is ready.
 
 ## Next steps
 

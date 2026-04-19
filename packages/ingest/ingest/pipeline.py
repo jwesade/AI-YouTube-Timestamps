@@ -1,8 +1,7 @@
-"""Orchestrates one end-to-end ingest run: fetch -> validate -> dedupe.
+"""Orchestrates one end-to-end ingest run: fetch -> validate -> dedupe -> (normalize) -> (write).
 
-Writing to the database is not part of this module yet — it will be plugged in
-once Supabase credentials are available. For now the pipeline returns a
-PipelineReport that the CLI serialises to JSON.
+The normalize and write steps are opt-in so the pipeline stays useful locally
+without API keys or DB credentials.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ingest import sources
+from ingest.agents.normalizer import NormalizedCourt, normalize
 from ingest.dedupe import Cluster, dedupe
 from ingest.models import FetchResult, SourceRecord
 from ingest.validate import ValidationReport, validate
@@ -27,6 +27,8 @@ class PipelineReport:
     fetches: list[FetchResult] = field(default_factory=list)
     validation: ValidationReport | None = None
     clusters: list[Cluster] = field(default_factory=list)
+    normalized: list[NormalizedCourt] = field(default_factory=list)
+    write_stats: dict[str, int] | None = None
 
     @property
     def raw_count(self) -> int:
@@ -45,7 +47,7 @@ class PipelineReport:
         return self.kept_count - self.cluster_count
 
     def summary(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat(),
             "duration_s": (self.finished_at - self.started_at).total_seconds(),
@@ -55,10 +57,19 @@ class PipelineReport:
             "unique_courts": self.cluster_count,
             "duplicates_removed": self.duplicates_removed,
             "multi_source_courts": sum(1 for c in self.clusters if len(c.source_types) > 1),
+            "normalized": len(self.normalized),
         }
+        if self.write_stats is not None:
+            out["write_stats"] = self.write_stats
+        return out
 
 
-def run_pipeline(source_names: list[str]) -> PipelineReport:
+def run_pipeline(
+    source_names: list[str],
+    *,
+    use_llm: bool = False,
+    write_to_db: bool = False,
+) -> PipelineReport:
     started = datetime.now(timezone.utc)
     fetches: list[FetchResult] = []
     all_records: list[SourceRecord] = []
@@ -72,6 +83,13 @@ def run_pipeline(source_names: list[str]) -> PipelineReport:
     validation = validate(all_records)
     clusters = dedupe(validation.kept)
 
+    llm = _build_llm() if use_llm else None
+    normalized = [normalize(cluster, llm=llm) for cluster in clusters]
+
+    write_stats: dict[str, int] | None = None
+    if write_to_db:
+        write_stats = _write(clusters, normalized)
+
     finished = datetime.now(timezone.utc)
     report = PipelineReport(
         started_at=started,
@@ -80,6 +98,22 @@ def run_pipeline(source_names: list[str]) -> PipelineReport:
         fetches=fetches,
         validation=validation,
         clusters=clusters,
+        normalized=normalized,
+        write_stats=write_stats,
     )
     log.info("pipeline done: %s", report.summary())
     return report
+
+
+def _build_llm():
+    from ingest.llm import AnthropicClient  # local import so tests don't need the key
+
+    return AnthropicClient()
+
+
+def _write(clusters: list[Cluster], normalized: list[NormalizedCourt]) -> dict[str, int]:
+    from ingest.config import require
+    from ingest.writer.supabase import write_clusters
+
+    stats = write_clusters(clusters, normalized, db_url=require("supabase_db_url"))
+    return {"courts_inserted": stats.courts_inserted, "sources_inserted": stats.sources_inserted}
