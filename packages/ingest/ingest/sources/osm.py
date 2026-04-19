@@ -2,11 +2,16 @@
 
 Free, no API key, Creative Commons licensed. Good coverage of clubs that OSM
 contributors have tagged; missing many commercial sites. Use as baseline.
+
+The main Overpass instance (overpass-api.de) is frequently overloaded and
+returns 504/503 on Germany-wide queries. We try several public mirrors in
+order and fall back across them.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -15,7 +20,14 @@ from ingest.models import FetchResult, SourceRecord
 
 log = logging.getLogger(__name__)
 
-OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
+# Public Overpass mirrors, ordered by observed reliability. Kumi first because
+# it's usually the fastest for Europe-wide queries; the main instance last
+# because it's the most throttled.
+OVERPASS_ENDPOINTS: tuple[str, ...] = (
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+)
 
 # Any OSM node/way/relation tagged sport=padel inside Germany.
 OVERPASS_QUERY_DE = """
@@ -27,24 +39,23 @@ area["ISO3166-1"="DE"][admin_level=2]->.de;
 out center tags;
 """.strip()
 
+_RETRYABLE_STATUS = {429, 502, 503, 504}
+
 
 class OSMSource:
     name = "osm"
 
-    def __init__(self, endpoint: str = OVERPASS_ENDPOINT, timeout: float = 200.0):
-        self._endpoint = endpoint
+    def __init__(
+        self,
+        endpoints: tuple[str, ...] = OVERPASS_ENDPOINTS,
+        timeout: float = 200.0,
+    ):
+        self._endpoints = endpoints
         self._timeout = timeout
 
     def fetch(self) -> FetchResult:
         log.info("fetching padel courts from OSM Overpass (DE)")
-        headers = {
-            "User-Agent": "padel-atlas-de/0.1 (+https://github.com/jwesade/ai-youtube-timestamps)",
-            "Accept": "application/json",
-        }
-        with httpx.Client(timeout=self._timeout, headers=headers) as client:
-            resp = client.post(self._endpoint, data={"data": OVERPASS_QUERY_DE})
-            resp.raise_for_status()
-            payload = resp.json()
+        payload = self._request_with_failover()
 
         records: list[SourceRecord] = []
         for element in payload.get("elements", []):
@@ -52,8 +63,37 @@ class OSMSource:
             if record is not None:
                 records.append(record)
 
-        log.info("OSM returned %d elements, kept %d records", len(payload.get("elements", [])), len(records))
+        log.info(
+            "OSM returned %d elements, kept %d records",
+            len(payload.get("elements", [])),
+            len(records),
+        )
         return FetchResult(source_type="osm", records=records)
+
+    def _request_with_failover(self) -> dict[str, Any]:
+        headers = {
+            "User-Agent": "padel-atlas-de/0.1 (+https://github.com/jwesade/ai-youtube-timestamps)",
+            "Accept": "application/json",
+        }
+        errors: list[tuple[str, Exception]] = []
+        with httpx.Client(timeout=self._timeout, headers=headers) as client:
+            for endpoint in self._endpoints:
+                try:
+                    log.info("trying Overpass endpoint: %s", endpoint)
+                    resp = client.post(endpoint, data={"data": OVERPASS_QUERY_DE})
+                    if resp.status_code in _RETRYABLE_STATUS:
+                        raise httpx.HTTPStatusError(
+                            f"status {resp.status_code}", request=resp.request, response=resp
+                        )
+                    resp.raise_for_status()
+                    return resp.json()
+                except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                    log.warning("endpoint %s failed: %s", endpoint, exc)
+                    errors.append((endpoint, exc))
+                    time.sleep(2)
+
+        detail = "; ".join(f"{url}: {err}" for url, err in errors)
+        raise RuntimeError(f"all Overpass endpoints failed ({detail})")
 
 
 def _element_to_record(element: dict[str, Any]) -> SourceRecord | None:
