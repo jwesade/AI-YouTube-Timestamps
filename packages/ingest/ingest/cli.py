@@ -28,7 +28,7 @@ def run(
     result = fetcher.fetch()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"courts_{source}.json"
-    out_path.write_text(result.model_dump_json(indent=2))
+    out_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
     typer.echo(f"wrote {result.count} records -> {out_path}")
 
 
@@ -58,7 +58,7 @@ def pipeline(
     summary_path = out_dir / "pipeline_summary.json"
     clusters_path = out_dir / "courts_clustered.json"
 
-    summary_path.write_text(json.dumps(report.summary(), indent=2))
+    summary_path.write_text(json.dumps(report.summary(), indent=2), encoding="utf-8")
     clusters_payload = [
         {
             "normalized": nc.model_dump(mode="json"),
@@ -67,7 +67,10 @@ def pipeline(
         }
         for c, nc in zip(report.clusters, report.normalized, strict=True)
     ]
-    clusters_path.write_text(json.dumps(clusters_payload, indent=2, default=str))
+    clusters_path.write_text(
+        json.dumps(clusters_payload, indent=2, default=str, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     typer.echo(json.dumps(report.summary(), indent=2))
     typer.echo(f"wrote summary -> {summary_path}")
