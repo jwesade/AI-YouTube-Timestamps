@@ -1,8 +1,12 @@
-"""Writes normalized clusters into Supabase (Postgres) via psycopg.
+"""Writes normalized venues into Supabase (Postgres) via psycopg.
 
 v0 strategy: truncate-and-reload. Simple and idempotent. Once we have manual
 annotations or multiple overlapping ingests, we upgrade to upsert on
 (source_type, source_ref) + court linkage by spatial proximity.
+
+One row in `courts` per Venue (a physical location). One row in `sources` per
+raw scraped record across all member clusters of the venue, preserving full
+provenance.
 """
 
 from __future__ import annotations
@@ -14,35 +18,35 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from ingest.agents.normalizer import NormalizedCourt
-from ingest.dedupe import Cluster
+from ingest.venues import Venue
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class WriteStats:
-    courts_inserted: int
+    venues_inserted: int
     sources_inserted: int
 
 
-def write_clusters(
-    clusters: list[Cluster],
+def write_venues(
+    venues: list[Venue],
     normalized: list[NormalizedCourt],
     db_url: str,
 ) -> WriteStats:
-    if len(clusters) != len(normalized):
+    if len(venues) != len(normalized):
         raise ValueError(
-            f"cluster/normalized length mismatch: {len(clusters)} vs {len(normalized)}"
+            f"venues/normalized length mismatch: {len(venues)} vs {len(normalized)}"
         )
 
-    courts_inserted = 0
+    venues_inserted = 0
     sources_inserted = 0
-    log.info("writing %d courts to Supabase", len(clusters))
+    log.info("writing %d venues to Supabase", len(venues))
 
     with psycopg.connect(db_url) as conn, conn.cursor() as cur:
         cur.execute("TRUNCATE sources, courts RESTART IDENTITY CASCADE")
 
-        for cluster, nc in zip(clusters, normalized, strict=True):
+        for venue, nc in zip(venues, normalized, strict=True):
             cur.execute(
                 """
                 INSERT INTO courts (
@@ -69,27 +73,28 @@ def write_clusters(
                 ),
             )
             court_id = cur.fetchone()[0]
-            courts_inserted += 1
+            venues_inserted += 1
 
-            for record in cluster.records:
-                cur.execute(
-                    """
-                    INSERT INTO sources (
-                        court_id, source_type, source_ref, source_url, raw_data
+            for cluster in venue.members:
+                for record in cluster.records:
+                    cur.execute(
+                        """
+                        INSERT INTO sources (
+                            court_id, source_type, source_ref, source_url, raw_data
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            court_id,
+                            record.source_type,
+                            record.source_ref,
+                            str(record.source_url) if record.source_url else None,
+                            Jsonb(record.raw),
+                        ),
                     )
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        court_id,
-                        record.source_type,
-                        record.source_ref,
-                        str(record.source_url) if record.source_url else None,
-                        Jsonb(record.raw),
-                    ),
-                )
-                sources_inserted += 1
+                    sources_inserted += 1
 
         conn.commit()
 
-    log.info("wrote %d courts, %d source rows", courts_inserted, sources_inserted)
-    return WriteStats(courts_inserted=courts_inserted, sources_inserted=sources_inserted)
+    log.info("wrote %d venues, %d source rows", venues_inserted, sources_inserted)
+    return WriteStats(venues_inserted=venues_inserted, sources_inserted=sources_inserted)

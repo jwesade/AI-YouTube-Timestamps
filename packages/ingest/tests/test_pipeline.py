@@ -31,5 +31,5 @@ def test_pipeline_end_to_end(monkeypatch):
 
     assert summary["raw_records"] == 5
     assert summary["after_validation"] == 3  # Paris + empty dropped
-    assert summary["unique_courts"] == 2  # the two Padel Base dupes merged
-    assert summary["duplicates_removed"] == 1
+    assert summary["clusters"] == 2  # the two Padel Base dupes merged
+    assert summary["venues"] == 2  # they're far apart, so still two venues

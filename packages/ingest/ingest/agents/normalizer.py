@@ -3,6 +3,10 @@
 Deterministic merge fills in what it can; the LLM is only called when there's
 ambiguity (conflicting names, missing fields that might be inferable). Keeps
 cost low and output reproducible for the easy cases.
+
+For Venues (groups of clusters at the same physical location), use
+`normalize_venue` instead — it normalizes the venue's "best" cluster and
+sets the canonical `court_count` from the actual number of pitches found.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from ingest.dedupe import Cluster
 from ingest.models import SourceRecord
+from ingest.venues import Venue
 
 if TYPE_CHECKING:
     from ingest.llm import LLMClient
@@ -60,6 +65,23 @@ def normalize(cluster: Cluster, llm: LLMClient | None = None) -> NormalizedCourt
     except Exception:
         log.exception("LLM normalization failed, falling back to deterministic merge")
         return deterministic
+
+
+def normalize_venue(venue: Venue, llm: LLMClient | None = None) -> NormalizedCourt:
+    """Normalize a Venue: pick its best cluster, normalize that, then override
+    `court_count` with the venue's actual pitch count."""
+    primary_cluster = _venue_primary_cluster(venue)
+    nc = normalize(primary_cluster, llm=llm)
+    return nc.model_copy(update={"court_count": venue.court_count})
+
+
+def _venue_primary_cluster(venue: Venue) -> Cluster:
+    primary_record = venue.primary
+    for cluster in venue.members:
+        if cluster.primary is primary_record:
+            return cluster
+    # Defensive fallback: should never happen since venue.primary comes from members.
+    return venue.members[0]
 
 
 def _deterministic_merge(cluster: Cluster) -> NormalizedCourt:

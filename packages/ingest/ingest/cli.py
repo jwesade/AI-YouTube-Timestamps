@@ -56,25 +56,27 @@ def pipeline(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "pipeline_summary.json"
-    clusters_path = out_dir / "courts_clustered.json"
+    clusters_path = out_dir / "venues.json"
 
     summary_path.write_text(json.dumps(report.summary(), indent=2), encoding="utf-8")
-    clusters_payload = [
+    venues_payload = [
         {
             "normalized": nc.model_dump(mode="json"),
-            "source_types": sorted(c.source_types),
-            "record_count": len(c.records),
+            "court_count": v.court_count,
+            "source_types": sorted(v.source_types),
+            "member_clusters": len(v.members),
+            "raw_records": sum(len(c.records) for c in v.members),
         }
-        for c, nc in zip(report.clusters, report.normalized, strict=True)
+        for v, nc in zip(report.venues, report.normalized, strict=True)
     ]
     clusters_path.write_text(
-        json.dumps(clusters_payload, indent=2, default=str, ensure_ascii=False),
+        json.dumps(venues_payload, indent=2, default=str, ensure_ascii=False),
         encoding="utf-8",
     )
 
     typer.echo(json.dumps(report.summary(), indent=2))
     typer.echo(f"wrote summary -> {summary_path}")
-    typer.echo(f"wrote clusters -> {clusters_path}")
+    typer.echo(f"wrote venues  -> {clusters_path}")
 
 
 @app.command("list-sources")

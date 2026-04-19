@@ -1,7 +1,9 @@
-"""Orchestrates one end-to-end ingest run: fetch -> validate -> dedupe -> (normalize) -> (write).
+"""Orchestrates one end-to-end ingest run.
 
-The normalize and write steps are opt-in so the pipeline stays useful locally
-without API keys or DB credentials.
+Steps: fetch -> validate -> dedupe -> group_into_venues -> (normalize) -> (write).
+
+Normalize and write are opt-in so the pipeline stays useful locally without
+API keys or DB credentials.
 """
 
 from __future__ import annotations
@@ -11,10 +13,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ingest import sources
-from ingest.agents.normalizer import NormalizedCourt, normalize
+from ingest.agents.normalizer import NormalizedCourt, normalize_venue
 from ingest.dedupe import Cluster, dedupe
 from ingest.models import FetchResult, SourceRecord
 from ingest.validate import ValidationReport, validate
+from ingest.venues import Venue, group_into_venues
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +30,7 @@ class PipelineReport:
     fetches: list[FetchResult] = field(default_factory=list)
     validation: ValidationReport | None = None
     clusters: list[Cluster] = field(default_factory=list)
+    venues: list[Venue] = field(default_factory=list)
     normalized: list[NormalizedCourt] = field(default_factory=list)
     write_stats: dict[str, int] | None = None
 
@@ -38,14 +42,6 @@ class PipelineReport:
     def kept_count(self) -> int:
         return self.validation.kept_count if self.validation else 0
 
-    @property
-    def cluster_count(self) -> int:
-        return len(self.clusters)
-
-    @property
-    def duplicates_removed(self) -> int:
-        return self.kept_count - self.cluster_count
-
     def summary(self) -> dict[str, object]:
         out: dict[str, object] = {
             "started_at": self.started_at.isoformat(),
@@ -54,9 +50,11 @@ class PipelineReport:
             "sources": self.sources,
             "raw_records": self.raw_count,
             "after_validation": self.kept_count,
-            "unique_courts": self.cluster_count,
-            "duplicates_removed": self.duplicates_removed,
-            "multi_source_courts": sum(1 for c in self.clusters if len(c.source_types) > 1),
+            "clusters": len(self.clusters),
+            "venues": len(self.venues),
+            "courts_total": sum(v.court_count for v in self.venues),
+            "multi_court_venues": sum(1 for v in self.venues if v.court_count > 1),
+            "multi_source_venues": sum(1 for v in self.venues if len(v.source_types) > 1),
             "normalized": len(self.normalized),
         }
         if self.write_stats is not None:
@@ -82,13 +80,14 @@ def run_pipeline(
 
     validation = validate(all_records)
     clusters = dedupe(validation.kept)
+    venues = group_into_venues(clusters)
 
     llm = _build_llm() if use_llm else None
-    normalized = [normalize(cluster, llm=llm) for cluster in clusters]
+    normalized = [normalize_venue(v, llm=llm) for v in venues]
 
     write_stats: dict[str, int] | None = None
     if write_to_db:
-        write_stats = _write(clusters, normalized)
+        write_stats = _write(venues, normalized)
 
     finished = datetime.now(timezone.utc)
     report = PipelineReport(
@@ -98,6 +97,7 @@ def run_pipeline(
         fetches=fetches,
         validation=validation,
         clusters=clusters,
+        venues=venues,
         normalized=normalized,
         write_stats=write_stats,
     )
@@ -111,9 +111,12 @@ def _build_llm():
     return AnthropicClient()
 
 
-def _write(clusters: list[Cluster], normalized: list[NormalizedCourt]) -> dict[str, int]:
+def _write(venues: list[Venue], normalized: list[NormalizedCourt]) -> dict[str, int]:
     from ingest.config import require
-    from ingest.writer.supabase import write_clusters
+    from ingest.writer.supabase import write_venues
 
-    stats = write_clusters(clusters, normalized, db_url=require("supabase_db_url"))
-    return {"courts_inserted": stats.courts_inserted, "sources_inserted": stats.sources_inserted}
+    stats = write_venues(venues, normalized, db_url=require("supabase_db_url"))
+    return {
+        "venues_inserted": stats.venues_inserted,
+        "sources_inserted": stats.sources_inserted,
+    }
